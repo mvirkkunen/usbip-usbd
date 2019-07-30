@@ -41,17 +41,3 @@ impl Server {
         (Events {}, UsbBus::new(device))
     }
 }
-
-pub struct Events {
-
-}
-
-impl Stream for Events {
-    type Item = ();
-
-    type Error = ();
-
-    fn poll(&mut self) -> Result<Async<Option<Self::Item>>, Self::Error> {
-        unimplemented!();
-    }
-}

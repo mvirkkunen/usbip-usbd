@@ -1,5 +1,6 @@
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use tokio::prelude::*;
 use crate::bus::NUM_ENDPOINTS;
 
 pub struct Device {
@@ -17,6 +18,38 @@ impl Device {
             endpoint_in: Default::default(),
             endpoint_out: Default::default(),
         }
+    }
+
+    pub fn submit(urb: Urb) -> Submit {
+
+    }
+}
+
+pub struct Submit {
+
+}
+
+impl Future for Submit {
+    type Item = ();
+
+    type Error = ();
+
+    fn poll(&mut self) -> Result<Async<Self::Item>, Self::Error> {
+        unimplemented!();
+    }
+}
+
+pub struct Events {
+
+}
+
+impl Stream for Events {
+    type Item = ();
+
+    type Error = ();
+
+    fn poll(&mut self) -> Result<Async<Option<Self::Item>>, Self::Error> {
+        unimplemented!();
     }
 }
 

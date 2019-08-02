@@ -33,11 +33,11 @@ impl Server {
         })
     }
 
-    pub fn attach(&self, bus_id: &str) -> (Events, UsbBusAllocator<UsbBus>) {
+    pub fn attach(&self, bus_id: &str) -> UsbBusAllocator<UsbBus> {
         let device = Arc::new(Device::new());
 
         self.shared.devices.write().unwrap().push(Arc::clone(&device));
 
-        (Events {}, UsbBus::new(device))
+        UsbBus::new(device)
     }
 }

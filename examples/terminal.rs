@@ -1,59 +1,52 @@
 //! A simple CDC-ACM "loopback in uppercase" serial port example, using USB/IP.
 
+use std::sync::Arc;
 use usb_device::prelude::*;
 use usb_device::bus::UsbBusAllocator;
-use usbip_usbd::{UsbBus, Server};
+use usbip_usbd::{UsbIpDeviceBuilder, Server};
 use usbd_serial::{USB_CLASS_CDC, SerialPort};
 use tokio::prelude::*;
 use tokio::sync::lock::Lock;
 
+#[tokio::main]
 fn main() {
-    static mut USB_BUS: Option<UsbBusAllocator<UsbBus>> = None;
+    let listener = Server::bind(&"127.0.0.1:3240".parse().unwrap())
+        .expect("Failed to create server");
 
-    let listener = Server::bind(&"127.0.0.1:3240".parse().unwrap()).unwrap();
+    loop {
+        let connection = listener.accept();
 
-    let (stream, usb_bus) = listener.attach("1-1");
+        let usb_bus = connection.attach("1-1");
 
-    let usb_bus = unsafe {
-        USB_BUS = Some(usb_bus);
-        USB_BUS.as_ref().unwrap()
-    };
+        let mut usb_dev = UsbDeviceBuilder::new(usb_bus, UsbVidPid(0x16c0, 0x27dd))
+            .manufacturer("Fake company")
+            .product("Serial port")
+            .serial_number("TEST")
+            .device_class(USB_CLASS_CDC)
+            .build();
 
-    let mut serial = SerialPort::new(usb_bus);
+        let serial_rx = Arc::new(Lock::new(SerialPort::new(usb_bus)));
 
-    let mut usb_dev = UsbDeviceBuilder::new(usb_bus, UsbVidPid(0x16c0, 0x27dd))
-        .manufacturer("Fake company")
-        .product("Serial port")
-        .serial_number("TEST")
-        .device_class(USB_CLASS_CDC)
-        .build();
+        let event = usb_dev.bus().event();
+        tokio::spawn(async move {
+            let mut stdout = tokio::io::stdout();
 
-    let mut stdout = tokio::io::stdout();
+            loop {
+                if !usb_dev.poll(&mut [&mut *serial_rx.lock().await]) {
+                    event.await?;
+                    continue;
+                }
 
-    let usb_stream = stream.for_each(move |_| {
-        if !usb_dev.poll(&mut [&mut serial]) && len == 0 {
-            return Ok(());
-        }
-
-        let buf = [0u8; 64];
-
-        match serial.read(&mut buf[..]) {
-            Ok(count) => {
-                stdout.write_buf(&buf[..count])
-            },
-            Err(UsbError::WouldBlock) => { Ok(()) },
-            Err(err) => {
-                println!("Read error: {:?}", err);
-                Ok(())
+                match serial_rx.lock().await.read(&mut buf[..]) {
+                    Ok(count) => {
+                        stdout.write_buf(&buf[..count]).await.unwrap();
+                    },
+                    Err(UsbError::WouldBlock) => event.await?,
+                    Err(err) => {
+                        println!("Read error: {:?}", err);
+                    }
+                }
             }
-        }
-    });
-
-    let stdout_stream = tokio::io::lines(tokio::io::stdin())
-        .for_each(|lines| {
-            
         });
-
-
-    tokio::run(server);
+    }
 }

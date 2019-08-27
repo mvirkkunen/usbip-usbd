@@ -1,43 +1,52 @@
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use tokio::prelude::*;
-use tokio::net::{TcpListener, Incoming};
+use tokio::net::TcpListener;
 use usb_device::bus::UsbBusAllocator;
-use crate::bus::UsbBus;
+use crate::bus::{UsbBus, Urb};
 use crate::device::Device;
 
-pub struct Server {
-    shared: Arc<Shared>,
+struct Connection<'a> {
+    stream: TcpStream,
+    devices: Vec<&'a UsbBus>,
 }
 
-struct Shared {
-    devices: RwLock<Vec<Arc<Device>>>,
+impl Connection {
+    fn new(&self, stream: TcpStream) -> self {
+        Connection {
+            stream,
+        }
+    }
+
+    pub fn attach(&mut self, bus_id: &str) -> UsbBusAllocator<Box<Pin<UsbBus>>> {
+        //let device = Arc::new(Device::new());
+
+        //self.shared.devices.write().unwrap().push(Arc::clone(&device));
+
+        UsbBus::new(bus_id)
+    }
+
+    pub fn complete_urb(&self) {
+        
+    }
+}
+
+pub struct Server {
+    listener: TcpListener,
 }
 
 impl Server {
     pub fn bind(addr: &SocketAddr) -> io::Result<Server> {
         let listener = TcpListener::bind(addr)?;
 
-        let shared = Arc::new(Shared {
-            devices: RwLock::new(Vec::new()),
-        });
-
-        listener.incoming()
-            .for_each(|sock| {
-                Ok(())
-            });
-
-        Ok(Server {
-            shared,
-        })
+        Ok(Server { listener })
     }
 
-    pub fn attach(&self, bus_id: &str) -> UsbBusAllocator<UsbBus> {
-        let device = Arc::new(Device::new());
+    pub async fn accept(&mut self) -> impl Future<Output = io::Result<Connection>> {
+        let stream = self.listener.accept()?;
 
-        self.shared.devices.write().unwrap().push(Arc::clone(&device));
-
-        UsbBus::new(device)
+        Connection::new(stream)
     }
 }

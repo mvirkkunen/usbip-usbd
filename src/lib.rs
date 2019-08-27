@@ -4,6 +4,6 @@ pub use bus::UsbBus;
 mod server;
 pub use server::Server;
 
-//mod device;
+mod device;
 
 mod protocol;

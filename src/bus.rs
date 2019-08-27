@@ -1,8 +1,10 @@
-use std::collections::{VecDeque, LinkedLIst};
-use std::sync::Arc;
-use bytes::Bytes;
-use tokio::sync::lock::Lock;
-use tokio::sync::mpsc::UnboundedSender<Urb>;
+use std::collections::VecDeque;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use bytes::{Bytes, BytesMut};
+use tokio::sync::Lock;
+use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::watch;
 use usb_device::{
     Result, UsbError, UsbDirection,
     class::UsbClass,
@@ -13,45 +15,54 @@ use crate::device::*;
 
 pub const NUM_ENDPOINTS: usize = 16;
 
-// TODO: Handle different transfer types differently!
-
 pub struct UsbBus {
-    urb_queue: Arc<Mutex<LinkedList<Urb>>>,
-    ep_in: [Enpdoint; NUM_ENDPOINTS],
-    ep_out: [Enpdoint; NUM_ENDPOINTS],
+    bus_id: String,
+    urb_queue: Arc<Mutex<VecDeque<Urb>>>,
+    complete_urb: UnboundedSender<Urb>,
+    poll_sender: watch::Sender<()>,
+    poll_receiver: watch::Receiver<()>,
+    ep_in: [Endpoint; NUM_ENDPOINTS],
+    ep_out: [Endpoint; NUM_ENDPOINTS],
 }
 
 /// Virtual USB peripheral driver
 impl UsbBus {
-    pub(crate) fn new(device: Arc<Device>) -> UsbBusAllocator<UsbBus> {
-        UsbBusAllocator::new(UsbBus {
+    pub(crate) fn new(bus_id: &str) -> UsbBusAllocator<Pin<Box<Self>>> {
+        let (poll_sender, poll_receiver) = mpsc::unbounded_channel();
+
+        UsbBusAllocator::new(Box::pin(UsbBus {
+            bus_id: String::from(bus_id),
+            urb_queue: Arc::new(Mutex::new(VecDeque::new())),
+            complete_urb
+            poll_sender,
+            poll_receiver,
             device,
             ep_in: Default::default(),
             ep_out: Default::default(),
-        })
+        }))
     }
 }
 
 impl UsbBus {
-    pub fn register_class<T: UsbClass<Self>>(&self, class: Arc<Lock<T>>) {
-        self.device.register_class(
-
+    pub fn events(&self) -> watch::Receiver<()> {
+        self.poll_receiver.clone()
     }
 
-    pub fn events(&self) -> Events {
-        self.device.events()
-    }
-    
-    fn take_next_urb(&self, ep_addr: EndpointAddress) -> Option<Urb> {
+    fn current_urb(&self, ep_addr: EndpointAddress, urb: &mut Option<Urb>) -> Option<&mut Urb> {
+        if urb.is_some() {
+            return urb.as_mut();
+        }
+
         let mut urb_queue = self.urb_queue.lock().unwrap();
 
-        match usb_queue.iter()
+        match urb_queue.iter()
             .enumerate()
             .find(|u| u.ep == ep_addr)
         {
             Some((index, urb)) => {
                 urb_queue.remove(index);
-                Some(urb),
+                *urb = Some(urb);
+                urb.as_mut()
             },
             None => None,
         }
@@ -62,7 +73,7 @@ impl UsbBus {
     }
 }
 
-impl usb_device::bus::UsbBus for UsbBus {
+impl usb_device::bus::UsbBus for Pin<Box<UsbBus>> {
     fn alloc_ep(
         &mut self,
         ep_dir: UsbDirection,
@@ -106,33 +117,56 @@ impl usb_device::bus::UsbBus for UsbBus {
             return Err(UsbError::BufferOverflow);
         }
 
-        // Just write packets to the Server
-
         let mut state = ep.state.lock().unwrap();
 
-        let buf_option = Some(buf);
+        let urb = match self.current_urb(ep_addr, &mut state.urb) {
+            // There is an active URB
+            Some(urb) => urb,
 
-        if state.urb.is_none() {
-            state.urb = self.take_next_urb(ep_addr);
+            // No active URB, try to store packet in the packet buffer
+            None => {
+                match state.packet {
+                    // Buffer is already in use
+                    Some(_) => return Err(UsbError::WouldBlock),
 
-            if let Some(b) = state.leftover.take() {
-                urb.data.extend_from_slice(&b);
+                    // Store packet in buffer
+                    None => {
+                        state.packet = Some(BytesMut::from(buf));
+                        return Ok(buf.len());
+                    },
+                }
             }
+        };
 
-            if state.urb.is_none() {
-                return Err(UsbError::WouldBlock);
+        if let Some(packet) = state.packet.take() {
+            // There is a packet waiting in the buffer, add it to the URB
+            urb.data.extend_from_slice(&packet);
+
+            if urb.data.len() == urb.len || packet.len() < ep.max_packet_size {
+                // The buffered packet completed the URB, store the current data in the buffer
+                // instead.
+
+                self.complete_urb(urb.take().unwrap());
+
+                state.packet = Some(BytesMut::from(buf));
+
+                return Ok(buf.len());
             }
         }
 
+        // Add the buffer to the URB
         urb.data.extend_from_slice(buf);
 
+        // If more data than the URB requested has been written, store the rest in the packet
+        // buffer.
         if urb.data.len() > urb.len {
-            self.leftover = Some(urb.data.split_off(urb.len));
+            self.packet = Some(urb.data.split_off(urb.len));
         }
 
-        // TODO: Is this correct?
         if urb.data.len() == urb.len || buf.len() < ep.max_packet_size {
-            self.complete_urb(state.urb.take());
+            // The URB is complete
+            
+            self.complete_urb(urb.take().unwrap());
         }
 
         Ok(buf.len())
@@ -148,36 +182,37 @@ impl usb_device::bus::UsbBus for UsbBus {
         if ep.ep_type.is_none() {
             return Err(UsbError::InvalidEndpoint);
         }
+
+        if buf.len() < ep.max_packet_Size {
+            return Err(UsbError::BufferOverflow);
+        }
         
         let mut state = ep.state.lock().unwrap();
 
-        if state.urb.is_none() {
-            state.urb = self.take_next_urb(ep_addr);
+        let urb = match self.current_urb(ep_addr, &mut state.urb) {
+            // There is an active URB
+            Some(urb) => urb,
 
-            if state.urb.is_none() {
-                return Err(UsbError::WouldBlock);
-            }
-        }
+            // There is no URB
+            None => return Err(UsbError::WouldBlock),
+        };
 
-        if state.buffer.is_empty() {
-            
-        }
+        if urb.data.len() <= buf.len() {
+            // The remaining data will be returned by this read, so the URB will be completed
 
-        match packets.get(0) {
-            Some(bytes) => {
-                if buf.len() < bytes.len() {
-                    return Err(UsbError::BufferOverflow);
-                }
+            let len = urb.data.len();
+            buf.copy_from_slice(&urb.data);
 
-                buf[..bytes.len()].copy_from_slice(&bytes);
+            self.complete_urb();
 
-                buf.pop_front();
+            Ok(len)
+        } else {
+            // A single packet will be read
 
-                Ok(bytes.len())
-            },
-            None => {
-                return Err(UsbError::WouldBlock);
-            }
+            let len = ep.max_packet_size;
+            buf.copy_from_slice(&buf.data.splic_to(len));
+
+            return Ok(len);
         }
     }
 
@@ -209,7 +244,7 @@ struct Endpoint {
 }
 
 struct EndpointState {
-    pub leftover: Option<BytesMut>,
+    pub packet: Option<BytesMut>,
     pub urb: Option<Urb>,
 }
 

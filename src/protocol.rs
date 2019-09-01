@@ -15,14 +15,16 @@ const OP_RET_SUBMIT: u32 = 0x00000003;
 const OP_CMD_UNLINK: u32 = 0x00000002;
 const OP_RET_UNLINK: u32 = 0x00000004;
 
-enum Request {
+#[derive(Debug)]
+pub enum Request {
     DevList,
     Import(String),
     Submit(SubmitRequest),
     Unlink(UnlinkRequest),
 }
 
-enum Response {
+#[derive(Debug)]
+pub enum Response {
     DevList(Vec<DeviceInterfaceInfo>),
     Import(ImportResponse),
     Submit(SubmitResponse),
@@ -30,13 +32,13 @@ enum Response {
 }
 
 #[derive(Debug)]
-struct DeviceInterfaceInfo {
+pub struct DeviceInterfaceInfo {
     pub device: DeviceInfo,
     pub interfaces: Vec<InterfaceInfo>,
 }
 
 #[derive(Debug)]
-struct DeviceInfo {
+pub struct DeviceInfo {
     pub path: String,
     pub busid: String,
     pub busnum: u32,
@@ -54,20 +56,20 @@ struct DeviceInfo {
 }
 
 #[derive(Debug)]
-struct InterfaceInfo {
+pub struct InterfaceInfo {
     pub interface_class: u8,
     pub interface_subclass: u8,
     pub interface_protocol: u8,
 }
 
 #[derive(Debug)]
-struct ImportResponse {
+pub struct ImportResponse {
     pub status: u32,
     pub device: Option<DeviceInfo>,
 }
 
 #[derive(Debug)]
-struct SubmitRequest {
+pub struct SubmitRequest {
     pub seqnum: u32,
     pub devid: u32,
     pub ep: EndpointAddress,
@@ -81,7 +83,7 @@ struct SubmitRequest {
 }
 
 #[derive(Debug)]
-struct SubmitResponse {
+pub struct SubmitResponse {
     pub seqnum: u32,
     pub devid: u32,
     pub ep: EndpointAddress,
@@ -95,7 +97,7 @@ struct SubmitResponse {
 }
 
 #[derive(Debug)]
-struct UnlinkRequest {
+pub struct UnlinkRequest {
     pub seqnum: u32,
     pub devid: u32,
     pub ep: EndpointAddress,
@@ -103,7 +105,7 @@ struct UnlinkRequest {
 }
 
 #[derive(Debug)]
-struct UnlinkResponse {
+pub struct UnlinkResponse {
     pub seqnum: u32,
     pub devid: u32,
     pub ep: EndpointAddress,
@@ -114,7 +116,7 @@ fn invalid_data() -> io::Error {
     io::Error::from(io::ErrorKind::InvalidData)
 }
 
-struct UsbIpCodec;
+pub struct UsbIpCodec;
 
 impl UsbIpCodec {
     const DEVICE_INFO_SIZE: usize = 256 + 32 + (3 * 4) + (3 * 2) + 6;
@@ -136,7 +138,7 @@ impl UsbIpCodec {
         }
 
         let ep = EndpointAddress::from_parts(
-            ep as usize,
+            ep as u8,
             if direction == 0 { UsbDirection::Out } else { UsbDirection::In });
 
         return Ok((seqnum, devid, ep));
@@ -178,7 +180,7 @@ impl UsbIpCodec {
         buf.put_u32_be(seqnum);
         buf.put_u32_be(devnum);
         buf.put_u32_be(if ep.direction() == UsbDirection::Out { 0 } else { 1 });
-        buf.put_u32_be(ep.index() as u32);
+        buf.put_u32_be(ep.number() as u32);
     }
 }
 
@@ -335,7 +337,9 @@ impl Encoder for UsbIpCodec {
             Response::Submit(res) => {
                 let data_len = res.data.as_ref().map(|d| d.len()).unwrap_or(0);
 
-                buf.reserve(Self::URB_HEADER_SIZE + (5 * 4) + 8 + data_len);
+                buf.reserve(4 + Self::URB_HEADER_SIZE + (5 * 4) + 8 + data_len);
+
+                buf.put_u32_be(OP_RET_SUBMIT);
                 
                 Self::encode_urb_header(res.seqnum, res.devid, res.ep, buf);
 
@@ -352,13 +356,13 @@ impl Encoder for UsbIpCodec {
                 }
             },
             Response::Unlink(res) => {
-                buf.reserve(Self::URB_HEADER_SIZE + 4);
+                buf.reserve(4 + Self::URB_HEADER_SIZE + 4);
                 
+                buf.put_u32_be(OP_RET_UNLINK);
+
                 Self::encode_urb_header(res.seqnum, res.devid, res.ep, buf);
                 buf.put_u32_be(res.status);
-
             },
-            _ => unimplemented!(),
         }
 
         Ok(())

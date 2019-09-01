@@ -8,8 +8,12 @@ repository = "https://github.com/mvirkkunen/usbip-usbd"
 
 [dependencies]
 bytes = "0.4.12"
-tokio = "0.2.0-alpha.2"
-usb-device = "0.2.2"
+tokio = "0.2.0-alpha.4"
 
 [dev-dependencies]
-usbd-serial = "0.1.0"
+#usbd-serial = "0.1.0"
+usbd-serial = { path = "../embrust/usbd-serial" }
+
+[dependencies.usb-device]
+git = "https://github.com/mvirkkunen/usb-device"
+rev = "327c7d08c8483c7e36306b5b9672083f5ca9317f"

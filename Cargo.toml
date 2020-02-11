@@ -12,7 +12,7 @@ tokio = "0.2.0-alpha.4"
 
 [dev-dependencies]
 #usbd-serial = "0.1.0"
-usbd-serial = { path = "../embrust/usbd-serial" }
+usbd-serial = { path = "../usbd-serial" }
 
 [dependencies.usb-device]
 git = "https://github.com/mvirkkunen/usb-device"

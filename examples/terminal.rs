@@ -12,10 +12,12 @@ async fn main() {
         .await
         .expect("Failed to create server");
     
+    let ip = listener.local_addr().unwrap().ip();
+
     println!("USB-IP server is running.");
     println!("Try:");
-    println!("  usbip list -r {}", listener.local_addr().unwrap().ip());
-    println!("  usbip attach -r {} -b 1-1", listener.local_addr().unwrap().ip());
+    println!("  usbip list -r {}", ip);
+    println!("  usbip attach -r {} -b 1-1", ip);
 
     while let Ok(mut client) = listener.accept().await {
         let mut usb_bus = client.attach("1-1");

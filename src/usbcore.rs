@@ -1,99 +1,92 @@
 use tokio::sync::watch;
 use usb_device::{
     Result, UsbError, UsbDirection,
-    allocator::{EndpointConfig, UsbAllocator},
     //class::UsbClass,
-    endpoint::{EndpointDescriptor, EndpointAddress},
-    bus::PollResult,
+    endpoint::{EndpointAddress, EndpointConfig},
+    usbcore::{self, PollResult},
 };
-use crate::server::BusChannel;
+use crate::server::CoreChannel;
 use crate::endpoint::{EndpointOut, EndpointIn};
 
 pub const NUM_ENDPOINTS: usize = 16;
 
-pub struct UsbBus {
-    channel: BusChannel,
+pub struct UsbCore {
+    channel: CoreChannel,
 }
 
 /// Virtual USB peripheral driver
-impl UsbBus {
-    pub(crate) fn new(channel: BusChannel) -> UsbAllocator<Self> {
-        UsbAllocator::new(UsbBus {
-            channel,
-        })
-    }
-
-    /*pub fn register_class<C: UsbClass<Self>>(cls: &Arc<Lock<C>>) {
-
-    }*/
-}
-
-impl UsbBus {
-    pub fn poller(&self) -> watch::Receiver<()> {
-        self.channel.poller()
+impl UsbCore {
+    pub(crate) fn new(channel: CoreChannel) -> UsbCore {
+        UsbCore { channel }
     }
 }
 
-impl usb_device::bus::UsbBus for UsbBus {
+impl usbcore::UsbCore for UsbCore {
     type EndpointOut = EndpointOut;
+
     type EndpointIn = EndpointIn;
+
     type EndpointAllocator = EndpointAllocator;
 
     fn create_allocator(&mut self) -> EndpointAllocator {
         EndpointAllocator::new(self.channel.clone())
     }
 
-    fn enable(&mut self) {
+    fn enable(&mut self, _alloc: EndpointAllocator) -> Result<()> {
         // nop
+        Ok(())
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self) -> Result<()> {
         // TODO
+        Ok(())
     }
 
-    fn set_device_address(&mut self, _addr: u8) {
+    fn set_device_address(&mut self, _addr: u8) -> Result<()> {
         // nop
+        Ok(())
     }
 
-    fn poll(&mut self) -> PollResult {
+    fn poll(&mut self) -> Result<PollResult> {
         // TODO
-        
-        PollResult::Data {
+
+        Ok(PollResult::Data {
             ep_out: 0xffff,
             ep_in_complete: 0xffff,
-            ep_setup: 0x001,
-        }
+        })
     }
 
-    fn set_stalled(&mut self, ep_addr: EndpointAddress, stalled: bool) {
+    fn set_stalled(&mut self, ep_addr: EndpointAddress, stalled: bool) -> Result<()> {
         let _ = ep_addr;
         let _ = stalled;
         unimplemented!();
     }
 
-    fn is_stalled(&self, ep_addr: EndpointAddress) -> bool {
+    fn is_stalled(&mut self, ep_addr: EndpointAddress) -> Result<bool> {
         let _ = ep_addr;
         unimplemented!();
     }
 
-    fn suspend(&mut self) {
-
+    fn suspend(&mut self) -> Result<()> {
+        // nop
+        Ok(())
     }
 
-    fn resume(&mut self) {
-
+    fn resume(&mut self) -> Result<()> {
+        // nop
+        Ok(())
     }
 }
 
 pub struct EndpointAllocator {
-    channel: BusChannel,
+    channel: CoreChannel,
     next_endpoint_number: u8,
     out_taken: u16,
     in_taken: u16,
 }
 
 impl EndpointAllocator {
-    fn new(channel: BusChannel) -> Self {
+    fn new(channel: CoreChannel) -> Self {
         EndpointAllocator {
             channel,
             next_endpoint_number: 1,
@@ -102,12 +95,13 @@ impl EndpointAllocator {
         }
     }
 
-    fn alloc_ep(&mut self, direction: UsbDirection, config: &EndpointConfig) 
-        -> Result<EndpointDescriptor>
+    fn alloc_ep(&mut self, direction: UsbDirection, config: &EndpointConfig)
+        -> Result<(EndpointAddress, usize)>
     {
-        // TODO: Use pair_of information
+        let number = config.fixed_address()
+            .map(|a| a.number())
+            .unwrap_or(self.next_endpoint_number);
 
-        let number = config.number.unwrap_or(self.next_endpoint_number);
         if number as usize >= NUM_ENDPOINTS {
             return Err(UsbError::EndpointOverflow);
         }
@@ -129,31 +123,39 @@ impl EndpointAllocator {
             },
         };
 
-        let descriptor = EndpointDescriptor {
+        /*let descriptor = EndpointDescriptor {
             address: EndpointAddress::from_parts(number, direction),
             ep_type: config.ep_type,
             max_packet_size: config.max_packet_size,
             interval: config.interval,
-        };
+        };*/
 
-        if config.number.is_none() {
+        if config.fixed_address().is_none() {
             self.next_endpoint_number += 1;
         }
 
-        Ok(descriptor)
+        Ok((EndpointAddress::from_parts(number, direction), config.max_packet_size().into()))
     }
 }
 
-impl usb_device::bus::EndpointAllocator<UsbBus> for EndpointAllocator {
+impl usb_device::usbcore::UsbEndpointAllocator<UsbCore> for EndpointAllocator {
     fn alloc_out(&mut self, config: &EndpointConfig) -> Result<EndpointOut> {
-        let descriptor = self.alloc_ep(UsbDirection::Out, config)?;
+        let (address, max_packet_size) = self.alloc_ep(UsbDirection::Out, config)?;
 
-        Ok(EndpointOut::new(descriptor, self.channel.clone()))
+        Ok(EndpointOut::new(address, max_packet_size, self.channel.clone()))
     }
-    
-    fn alloc_in(&mut self, config: &EndpointConfig) -> Result<EndpointIn> {
-        let descriptor = self.alloc_ep(UsbDirection::In, config)?;
 
-        Ok(EndpointIn::new(descriptor, self.channel.clone()))
+    fn alloc_in(&mut self, config: &EndpointConfig) -> Result<EndpointIn> {
+        let (address, max_packet_size) = self.alloc_ep(UsbDirection::In, config)?;
+
+        Ok(EndpointIn::new(address, max_packet_size, self.channel.clone()))
+    }
+
+    fn begin_interface(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn next_alt_setting(&mut self) -> Result<()> {
+        Ok(())
     }
 }

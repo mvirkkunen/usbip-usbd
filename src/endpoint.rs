@@ -1,39 +1,35 @@
-use bytes::Bytes;
 use usb_device::{
-    Result, UsbError, UsbDirection,
-    endpoint::{
-        Endpoint as _,
-        EndpointAddress,
-        EndpointDescriptor
-    }
+    Result, UsbDirection, UsbError,
+    usbcore,
+    endpoint::{EndpointAddress, EndpointConfig, OutPacketType},
 };
-use crate::server::{Urb, BusChannel, ControlState};
+use crate::server::{ControlState, CoreChannel, Urb};
 
 fn update_urb<'a>(
     ep_addr: EndpointAddress,
     urb: &'a mut Option<Urb>,
-    channel: &mut BusChannel) -> &'a mut Option<Urb>
+    channel: &mut CoreChannel) -> Option<&'a mut Urb>
 {
-    match urb {
-        Some(_) => urb,
-        None => {
-            *urb = channel.take_next_urb(ep_addr);
-            urb
-        }
+    if urb.is_none() {
+        *urb = channel.take_next_urb(ep_addr);
     }
+
+    urb.as_mut()
 }
 
 pub struct EndpointOut {
-    descriptor: EndpointDescriptor,
-    channel: BusChannel,
+    address: EndpointAddress,
+    max_packet_size: usize,
+    channel: CoreChannel,
     stalled: bool,
     urb: Option<Urb>,
 }
 
 impl EndpointOut {
-    pub fn new(descriptor: EndpointDescriptor, channel: BusChannel) -> EndpointOut {
+    pub fn new(address: EndpointAddress, max_packet_size: usize, channel: CoreChannel) -> EndpointOut {
         EndpointOut {
-            descriptor,
+            address,
+            max_packet_size,
             channel,
             stalled: false,
             urb: None,
@@ -41,199 +37,223 @@ impl EndpointOut {
     }
 }
 
-impl usb_device::endpoint::Endpoint for EndpointOut {
-    fn descriptor(&self) -> &EndpointDescriptor { &self.descriptor }
+impl usbcore::UsbEndpoint for EndpointOut {
+    fn address(&self) -> EndpointAddress {
+        self.address
+    }
 
-    fn enable(&mut self) {
+    unsafe fn enable(&mut self, _config: &EndpointConfig) -> Result<()> {
         // TODO
+        Ok(())
     }
 
-    fn disable(&mut self) {
-        unimplemented!();
+    fn disable(&mut self) -> Result<()> {
+        // TODO
+        Ok(())
     }
 
-    fn set_stalled(&mut self, is_stalled: bool) {
+    fn set_stalled(&mut self, is_stalled: bool) -> Result<()> {
         self.stalled = is_stalled;
+
+        Ok(())
     }
 
-    fn is_stalled(&self) -> bool {
-        self.stalled
+    fn is_stalled(&mut self) -> Result<bool> {
+        Ok(self.stalled)
     }
 }
 
-impl usb_device::endpoint::EndpointOut for EndpointOut {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        if buf.len() < self.max_packet_size() as usize {
+impl usbcore::UsbEndpointOut for EndpointOut {
+    fn read_packet(&mut self, buf: &mut [u8]) -> Result<(usize, OutPacketType)> {
+        println!("read {:?}", self.address);
+
+        if buf.len() < self.max_packet_size {
             return Err(UsbError::BufferOverflow);
         }
 
-        let max_packet_size = self.max_packet_size() as usize;
+        let urb = update_urb(self.address, &mut self.urb, &mut self.channel)
+            .ok_or(UsbError::WouldBlock)?;
 
-        let urb = match update_urb(self.address(), &mut self.urb, &mut self.channel) {
-            // There is an active URB
-            Some(urb) => urb,
-
-            // There is no URB
-            None => return Err(UsbError::WouldBlock),
-        };
-
-        if let Some(mut control) = urb.control {
+        if let Some(ref mut control) = urb.control {
             match control.state {
                 ControlState::Setup => {
-                    // This is the SETUP part of a control transfer, return the SETUP packet
+                    // Return SETUP data
 
-                    match urb.req_ep.direction() { 
-                        UsbDirection::Out => {
-                            // Control OUT - this endpoint will keep the request
+                    let req = &control.request;
 
-                            if control.length > 0 {
-                                // DATA stage - prepare to read data
-                            }
-                        },
+                    buf[..8].copy_from_slice(&[
+                        // bmRequestType
+                        (req.direction as u8) | ((req.request_type as u8) << 5) | (req.recipient as u8),
+                        // bRequest
+                        req.request,
+                        // wValue
+                        req.value as u8, (req.value >> 8) as u8,
+                        // wIndex
+                        req.index as u8, (req.index >> 8) as u8,
+                        // wLength
+                        req.length as u8, (req.length >> 8) as u8,
+                    ]);
 
-                        UsbDirection::In => {
+                    if urb.len > 0 {
+                        // There is a data stage
 
-                        },
+                        control.state = ControlState::Data;
+
+                        if req.direction == UsbDirection::In {
+                            // Data is in the other direction - pass to other endpoint
+
+                            self.channel.complete_urb(self.urb.take().unwrap());
+                        }
+                    } else {
+                        control.state = ControlState::Status;
+
+                        // No data stage - pass to other endpoint for status
+
+                        self.channel.complete_urb(self.urb.take().unwrap());
                     }
 
-                    buf[..8].copy_from_slice(&control.setup);
-
-                    return Ok(8);
+                    return Ok((8, OutPacketType::Setup));
                 },
-                ControlState::DataOut => {
-                    // continue handling below like any URB
-                }
+
+                ControlState::Data => { /* handled below */ },
+
+                ControlState::Status => {
+                    // Return empty STATUS packet
+
+                    control.state = ControlState::Complete;
+
+                    self.channel.complete_urb(self.urb.take().unwrap());
+
+                    return Ok((0, OutPacketType::Data));
+                },
+
+                ControlState::Complete => panic!("Complete control USB passed to OUT endpoint"),
             }
         }
-        
-        if urb.data.len() <= buf.len() {
+
+        if urb.data.len() <= self.max_packet_size {
             // The remaining data will be returned by this read, so the URB will be completed
+
+            // TODO: Do we need to simulate ZLP
 
             let len = urb.data.len();
             buf[..len].copy_from_slice(&urb.data);
 
+            if let Some(ref mut control) = urb.control {
+                match control.state {
+                    ControlState::Setup => panic!("Invalid read in Setup state"),
+
+                    ControlState::Data => {
+                        control.state = ControlState::Status;
+                    },
+
+                    ControlState::Status => panic!("Invalid read in Status state"),
+
+                    ControlState::Complete => panic!("Complete control USB passed to OUT endpoint"),
+                }
+            }
+
             self.channel.complete_urb(self.urb.take().unwrap());
 
-            Ok(len)
+            Ok((len, OutPacketType::Data))
         } else {
             // A single packet will be read
 
-            let len = max_packet_size;
+            let len = self.max_packet_size;
             buf.copy_from_slice(urb.data.split_to(len).as_ref());
 
-            Ok(len);
+            Ok((len, OutPacketType::Data))
         }
     }
 }
 
 pub struct EndpointIn {
-    descriptor: EndpointDescriptor,
-    channel: BusChannel,
+    address: EndpointAddress,
+    max_packet_size: usize,
+    channel: CoreChannel,
     stalled: bool,
     urb: Option<Urb>,
-    leftover: Option<Bytes>,
 }
 
 impl EndpointIn {
-    pub fn new(descriptor: EndpointDescriptor,  channel: BusChannel) -> EndpointIn {
+    pub fn new(address: EndpointAddress, max_packet_size: usize, channel: CoreChannel) -> EndpointIn {
         EndpointIn {
-            descriptor,
+            address,
+            max_packet_size,
             channel,
             stalled: false,
             urb: None,
-            leftover: None,
         }
     }
 }
 
-impl usb_device::endpoint::Endpoint for EndpointIn {
-    fn descriptor(&self) -> &EndpointDescriptor { &self.descriptor }
-    
-    fn enable(&mut self) {
+impl usbcore::UsbEndpoint for EndpointIn {
+    fn address(&self) -> EndpointAddress {
+        self.address
+    }
+
+    unsafe fn enable(&mut self, _config: &EndpointConfig) -> Result<()> {
         // TODO
+        Ok(())
     }
 
-    fn disable(&mut self) {
-        unimplemented!();
+    fn disable(&mut self) -> Result<()> {
+        // TODO
+        Ok(())
     }
 
-    fn set_stalled(&mut self, is_stalled: bool) {
+    fn set_stalled(&mut self, is_stalled: bool) -> Result<()> {
         self.stalled = is_stalled;
+
+        Ok(())
     }
 
-    fn is_stalled(&self) -> bool {
-        self.stalled
+    fn is_stalled(&mut self) -> Result<bool> {
+        Ok(self.stalled)
     }
 }
 
-impl usb_device::endpoint::EndpointIn for EndpointIn {
-    fn write(&mut self, buf: &[u8]) -> Result<()> {
-        if buf.len() > self.max_packet_size() as usize {
+impl usbcore::UsbEndpointIn for EndpointIn {
+    fn write_packet(&mut self, buf: &[u8]) -> Result<()> {
+        if buf.len() > self.max_packet_size {
             return Err(UsbError::BufferOverflow);
         }
 
         println!("writing {:?}", buf);
 
-        let max_packet_size = self.max_packet_size() as usize;
-
-        let urb = match update_urb(self.address(), &mut self.urb, &mut self.channel) {
-            // There is an active URB
-            Some(urb) => urb,
-
-            // No active URB, try to store packet in the leftover buffer
-            None => return match self.leftover {
-                // Leftover buffer is already in use
-                Some(_) => Err(UsbError::WouldBlock),
-
-                // Store packet in leftover buffer
-                None => {
-                    self.leftover = Some(Bytes::from(buf));
-                    Ok(())
-                },
-            },
-        };
-
-        if let Some(leftover) = self.leftover.take() {
-            // There is a packet waiting in the buffer, add it to the URB
-            urb.data.extend_from_slice(&leftover);
-
-            if urb.data.len() >= urb.len || leftover.len() < max_packet_size {
-                // The leftover buffer completed the URB
-
-                if urb.data.len() > urb.len {
-                    self.leftover = Some(urb.data.split_off(urb.len).freeze());
-                }
-
-                self.channel.complete_urb(self.urb.take().unwrap());
-
-                return if self.leftover.is_none() {
-                    // Store the current packet in the leftover buffer instead
-                    self.leftover = Some(Bytes::from(buf));
-
-                    Ok(())
-                } else {
-                    // There is still data in the leftover buffer
-
-                    Err(UsbError::WouldBlock)
-                };
-            }
-        }
+        let urb = update_urb(self.address, &mut self.urb, &mut self.channel)
+            .ok_or(UsbError::WouldBlock)?;
 
         // Add the buffer to the URB
         urb.data.extend_from_slice(buf);
 
-        // If more data than the URB requested has been written, store the rest in the packet
-        // buffer.
-        if urb.data.len() > urb.len {
-            self.leftover = Some(urb.data.split_off(urb.len).freeze());
-        }
-
-        if urb.data.len() == urb.len || buf.len() < self.max_packet_size() as usize {
+        if buf.len() < self.max_packet_size {
             // The URB is complete
-            
+
+            if let Some(ref mut control) = urb.control {
+                match control.state {
+                    ControlState::Setup => panic!("SETUP passed to IN endpoint"),
+
+                    ControlState::Data => {
+                        control.state = ControlState::Status;
+                    }
+
+                    ControlState::Status => {
+                        control.state = ControlState::Complete;
+                    },
+
+                    ControlState::Complete => panic!("Complete control USB passed to IN endpoint"),
+                }
+            }
+
             self.channel.complete_urb(self.urb.take().unwrap());
         }
 
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        // TODO
         Ok(())
     }
 }

@@ -1,7 +1,7 @@
 pub mod endpoint;
 
-mod bus;
-pub use bus::UsbBus;
+mod usbcore;
+pub use usbcore::UsbCore;
 
 mod server;
 pub use server::Server;

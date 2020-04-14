@@ -1,16 +1,29 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{
+        AtomicBool,
+        Ordering::SeqCst,
+    }
+};
 use bytes::{Bytes, BytesMut};
-use tokio::prelude::*;
+use futures::sink::SinkExt as _;
+use futures::stream::StreamExt as _;
+//use futures_codec::Framed;
+//use tokio::prelude::*;
+//use tokio::stream::StreamExt as _;
 use tokio::sync::{mpsc, watch};
 use tokio::net::{TcpListener, TcpStream};
-use usb_device::UsbDirection;
-use usb_device::allocator::UsbAllocator;
-use usb_device::control::Request;
-use usb_device::endpoint::EndpointAddress;
-use crate::bus::UsbBus;
+use tokio_util::codec::Framed;
+use usb_device::{
+    UsbDirection,
+    control,
+    descriptor,
+    endpoint::EndpointAddress,
+};
+use crate::usbcore::UsbCore;
 use crate::protocol::*;
 
 pub struct Server {
@@ -37,179 +50,236 @@ impl Server {
 pub struct Client {
     stream: TcpStream,
     next_devid: u32,
-    buses: HashMap<u32, BusShared>,
+    cores: HashMap<u32, ClientCore>,
+    complete_sender: mpsc::UnboundedSender<Urb>,
+    complete_receiver: mpsc::UnboundedReceiver<Urb>,
 }
 
 impl Client {
     fn new(stream: TcpStream) -> Self {
+        let (complete_sender, complete_receiver) = mpsc::unbounded_channel();
+
         Client {
             stream,
             next_devid: 1,
-            buses: HashMap::new(),
+            cores: HashMap::new(),
+            complete_sender,
+            complete_receiver,
         }
     }
 
-    pub fn attach(&mut self, bus_id: &str) -> UsbAllocator<UsbBus> {
-        //let device = Arc::new(Device::new());
-
-        //self.shared.devices.write().unwrap().push(Arc::clone(&device));
-
+    pub fn attach(&mut self, bus_id: &str) -> (UsbCore, Poller) {
         let devid = self.next_devid;
         self.next_devid += 1;
 
-        let mut shared = BusShared::new(devid, bus_id);
+        let (ccore, poller) = ClientCore::new(devid, bus_id, self.complete_sender.clone());
 
-        let bus = UsbBus::new(shared.channel());
+        let usbcore = UsbCore::new(ccore.channel.clone());
 
-        self.buses.insert(devid, shared);
+        self.cores.insert(devid, ccore);
 
-        bus
+        (usbcore, poller)
     }
 
-    pub async fn run(mut self) -> tokio::io::Result<()> {
-        let mut framed = tokio::codec::Framed::new(self.stream, UsbIpCodec);
+    pub async fn run(mut self) -> io::Result<()> {
+        let (sink, mut stream) = Framed::new(self.stream, UsbIpCodec).split();
+        let sink = Arc::new(tokio::sync::Mutex::new(sink));
 
-        println!("reading a thing");
+        let mut complete_receiver = self.complete_receiver;
 
-        while let Some(packet) = framed.next().await {
-            let packet = match packet {
-                Ok(p) => p,
-                Err(err) => {
-                    println!("Error: {:?}", err);
-                    return Err(err);
+        let csink = Arc::clone(&sink);
+
+        tokio::spawn(async move {
+            while let Some(urb) = complete_receiver.recv().await {
+                if urb.internal {
+                    println!("completed internal urb: {:?}", urb);
+                    continue;
                 }
-            };
+
+                csink.lock().await.send(
+                    Response::Submit(
+                        SubmitResponse {
+                            seqnum: urb.seqnum,
+                            devid: urb.devid,
+                            ep: urb.req_ep,
+                            //status: urb.status,
+                            status: 0, // TODO
+                            actual_length: urb.data.len() as u32,
+                            actual_start_frame: 0,
+                            number_of_packets: 0,
+                            error_count: 0,
+                            setup: None,
+                            data: Some(urb.data.into()),
+                        })).await.expect("send failed");
+            }
+        });
+
+        self.cores.values_mut().next().unwrap().enumerate().await;
+
+        while let Some(packet) = stream.next().await {
+            let packet = packet?;
+
+            println!("{:?}", &packet);
 
             match packet {
                 Request::DevList => {
                     let mut devices = Vec::new();
 
-                    for bus in self.buses.values_mut() {
-                        devices.push(bus.enumerate().await);
+                    for usb in self.cores.values_mut() {
+                        devices.push(usb.enumerate().await);
                     }
 
-                    framed.send(Response::DevList(devices)).await;
+                    sink.lock().await.send(Response::DevList(devices)).await?;
+                },
+                Request::Import(bus_id) => {
+                    // TODO
+                },
+                Request::Submit(req) => {
+                    // TODO
+                },
+                Request::Unlink(req) => {
+                    // TODO
                 },
                 _ => { }
             }
 
-            println!("{:?}", packet);
+            //self.request_poll_sender.send(()).unwrap();
         }
 
         Ok(())
     }
 }
 
-pub struct BusShared {
+pub struct Poller(watch::Receiver<()>);
+
+impl Poller {
+    pub async fn poll(&mut self) {
+        self.0.recv().await;
+    }
+}
+
+pub struct ClientCore {
     devid: u32,
     bus_id: String,
     urb_queue: Arc<Mutex<VecDeque<Urb>>>,
-    complete_sender: mpsc::UnboundedSender<Urb>,
-    complete_receiver: mpsc::UnboundedReceiver<Urb>,
     poll_sender: watch::Sender<()>,
-    poll_receiver: watch::Receiver<()>,
+    channel: CoreChannel,
 }
 
-impl BusShared {
-    pub fn new(devid: u32, bus_id: &str) -> Self {
-        let (complete_sender, complete_receiver) = mpsc::unbounded_channel();
+impl ClientCore {
+    pub fn new(devid: u32, bus_id: &str, complete_sender: mpsc::UnboundedSender<Urb>)
+        -> (Self, Poller)
+    {
         let (poll_sender, poll_receiver) = watch::channel(());
 
-        BusShared {
-            devid,
-            bus_id: bus_id.to_owned(),
-            urb_queue: Arc::new(Mutex::new(VecDeque::new())),
-            complete_sender,
-            complete_receiver,
-            poll_sender,
-            poll_receiver,
-        }
-    }
+        let urb_queue = Arc::new(Mutex::new(VecDeque::new()));
 
-    pub fn channel(&mut self) -> BusChannel {
-        BusChannel {
-            urb_queue: Arc::clone(&self.urb_queue),
-            complete_sender: self.complete_sender.clone(),
-            poll_receiver: self.poll_receiver.clone(),
-        }
+        (
+            ClientCore {
+                devid,
+                bus_id: bus_id.to_owned(),
+                urb_queue: Arc::clone(&urb_queue),
+                poll_sender,
+                channel: CoreChannel {
+                    urb_queue,
+                    complete_sender,
+                    internal_complete_sender: Arc::new(Mutex::new(None)),
+                    control_in_progress: Arc::new(AtomicBool::new(false)),
+                }
+            },
+            Poller(poll_receiver),
+        )
     }
 
     pub fn submit_urb(&mut self, urb: Urb) {
         // Control transfers must always first be directed to the control OUT endpoint for SETUP
-
-        if urb.control.is_some() {
+        /*if urb.is_control {
             urb.ep = EndpointAddress::from_parts(urb.req_ep.number(), UsbDirection::Out);
-        }
+        }*/
 
         self.urb_queue.lock().unwrap().push_back(urb);
-        self.poll_sender.broadcast(());
+        self.poll_sender.broadcast(()).expect("poll send failed");
     }
 
     pub async fn enumerate(&mut self) -> DeviceInterfaceInfo {
-        
+        let device = self.internal_control_transfer(control::Request {
+            direction: UsbDirection::In,
+            request_type: control::RequestType::Standard,
+            recipient: control::Recipient::Device,
+            request: control::Request::GET_DESCRIPTOR,
+            value: u16::from(descriptor::descriptor_type::DEVICE) << 8,
+            index: 0,
+            length: 0xffff,
+        }).await;
 
-        while let Some(urb) = self.complete_receiver.recv().await {
+        println!("{:?}", device);
+
+        let config = self.internal_control_transfer(control::Request {
+            direction: UsbDirection::In,
+            request_type: control::RequestType::Standard,
+            recipient: control::Recipient::Device,
+            request: control::Request::GET_DESCRIPTOR,
+            value: u16::from(descriptor::descriptor_type::CONFIGURATION) << 8,
+            index: 0,
+            length: 0xffff,
+        }).await;
+
+        println!("{:?}", config);
+
+        /*while let Some(urb) = self.complete_receiver.recv().await {
             if !urb.internal {
                 continue;
             }
 
             println!("internal complete 2: {:?}", urb);
-        }
+        }*/
 
         panic!("rip");
     }
 
-    async fn control_transfer(&mut self, req: Request) -> Result<Option<Bytes>, ()> {
+    async fn internal_control_transfer(&mut self, request: control::Request)
+        -> Result<Bytes, ()>
+    {
         self.submit_urb(Urb {
             seqnum: 0,
             devid: 0,
-            ep: EndpointAddress::from_parts(0, req.direction),
-            req_ep: EndpointAddress::from_parts(0, req.direction),
-            len: req.length as usize,
-            control: Some(Control {
-                setup: [
-                    // bmRequestType
-                    (req.direction as u8) | ((req.request_type as u8) << 5) | (req.recipient as u8),
-                    // bRequest
-                    req.request,
-                    // wValue
-                    req.value as u8, (req.value >> 8) as u8,
-                    // wIndex
-                    req.index as u8, (req.index >> 8) as u8,
-                    // wLength
-                    req.length as u8, (req.length >> 8) as u8,
-                ],
-                state: ControlState::Setup,
-            }),
+            ep: EndpointAddress::from_parts(0, UsbDirection::Out),
+            req_ep: EndpointAddress::from_parts(0, request.direction),
+            len: request.length as usize,
+            control: Some(
+                UrbControl {
+                    request,
+                    state: ControlState::Setup,
+                }
+            ),
             data: BytesMut::new(),
             internal: true,
         });
 
-        while let Some(urb) = self.complete_receiver.recv().await {
-            if !urb.internal {
-                continue;
-            }
+        let (sender, mut receiver) = mpsc::unbounded_channel();
 
-            return 
-        }
+        *self.channel.internal_complete_sender.lock().unwrap() = Some(sender);
+
+        println!("begin xfer");
+        let urb = receiver.recv().await.ok_or(())?;
+        println!("end xfer");
+
+        *self.channel.internal_complete_sender.lock().unwrap() = None;
+
+        Ok(urb.data.into())
     }
 }
 
-pub struct BusChannel {
+// The Arc/Mutex mess is probably backwards
+pub struct CoreChannel {
     urb_queue: Arc<Mutex<VecDeque<Urb>>>,
     complete_sender: mpsc::UnboundedSender<Urb>,
-    poll_receiver: watch::Receiver<()>,
+    internal_complete_sender: Arc<Mutex<Option<mpsc::UnboundedSender<Urb>>>>,
+    // TODO: Make this per endpoint or something
+    control_in_progress: Arc<AtomicBool>,
 }
 
-impl BusChannel {
-    pub fn clone(&self) -> BusChannel {
-        BusChannel {
-            urb_queue: Arc::clone(&self.urb_queue),
-            complete_sender: self.complete_sender.clone(),
-            poll_receiver: self.poll_receiver.clone(),
-        }
-    }
-
+impl CoreChannel {
     pub fn take_next_urb(&mut self, ep_addr: EndpointAddress) -> Option<Urb> {
         let mut queue = self.urb_queue.lock().unwrap();
 
@@ -217,7 +287,17 @@ impl BusChannel {
             .enumerate()
             .find(|u| u.1.ep == ep_addr)
         {
-            Some((index, _)) => {
+            Some((index, urb)) => {
+                if let Some(control) = &urb.control {
+                    if self.control_in_progress.load(SeqCst) {
+                        if control.state == ControlState::Setup {
+                            return None;
+                        }
+                    } else {
+                        self.control_in_progress.store(true, SeqCst);
+                    }
+                }
+
                 queue.remove(index)
             },
             None => None,
@@ -225,26 +305,55 @@ impl BusChannel {
     }
 
     pub fn complete_urb(&mut self, mut urb: Urb) {
-        if urb.setup.is_some() && urb.ep.direction() == UsbDirection::In {
-            // This URB was for a CONTROL IN transfer, pass it on to the OUT endpoint for the
-            // response
+        if let Some(ref mut control) = urb.control {
+            match control.state {
+                ControlState::Setup => panic!("Cannot complete_urb a SETUP"),
 
-            urb.setup = None;
-            urb.ep = EndpointAddress::from_parts(urb.ep.number(), UsbDirection::Out);
+                ControlState::Data => {
+                    // OUT endpoint is passing to IN endpoint
 
-            self.urb_queue.lock().unwrap().push_front(urb);
-        } else {
-            match self.complete_sender.try_send(urb) {
-                Ok(_) => {},
-                Err(_) => {
-                    panic!("try_send failed");
+                    urb.ep = EndpointAddress::from_parts(urb.ep.number(), UsbDirection::In);
+
+                    self.urb_queue.lock().unwrap().push_front(urb);
+                    return;
+                },
+
+                ControlState::Status => {
+                    let status_dir = match control.request.direction {
+                        UsbDirection::Out => UsbDirection::In,
+                        UsbDirection::In => UsbDirection::Out,
+                    };
+
+                    urb.ep = EndpointAddress::from_parts(urb.ep.number(), status_dir);
+
+                    self.urb_queue.lock().unwrap().push_front(urb);
+                    return;
+                },
+
+                ControlState::Complete => {
+                    /* handled below */
+
+                    self.control_in_progress.store(false, SeqCst);
                 }
-            };
+            }
+        }
+
+        if let Some(sender) = self.internal_complete_sender.lock().unwrap().take() {
+            sender.send(urb).unwrap();
+        } else {
+            self.complete_sender.send(urb).unwrap();
         }
     }
+}
 
-    pub fn poller(&self) -> watch::Receiver<()> {
-        self.poll_receiver.clone()
+impl Clone for CoreChannel {
+    fn clone(&self) -> CoreChannel {
+        CoreChannel {
+            urb_queue: Arc::clone(&self.urb_queue),
+            complete_sender: self.complete_sender.clone(),
+            internal_complete_sender: Arc::clone(&self.internal_complete_sender),
+            control_in_progress: Arc::clone(&self.control_in_progress),
+        }
     }
 }
 
@@ -255,23 +364,21 @@ pub struct Urb {
     pub ep: EndpointAddress, // current endpoint processing this URB
     pub req_ep: EndpointAddress, // request endpoint, could be different for control URBs
     pub len: usize,
-    pub control: Option<Control>,
+    pub control: Option<UrbControl>,
     pub data: BytesMut,
     pub internal: bool,
 }
 
 #[derive(Debug)]
-pub struct Control {
-    pub setup: [u8; 8],
+pub struct UrbControl {
+    pub request: control::Request,
     pub state: ControlState,
 }
 
 #[derive(Eq, PartialEq, Debug)]
 pub enum ControlState {
     Setup,
-    DataIn,
-    StatusOut
-    DataOut,
-    StatusIn,
+    Data,
+    Status,
     Complete,
 }

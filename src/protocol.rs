@@ -1,6 +1,6 @@
 use std::io::{self, Cursor};
 use bytes::*;
-use tokio::codec::{Encoder, Decoder};
+use tokio_util::codec::{Encoder, Decoder};
 
 use usb_device::UsbDirection;
 use usb_device::endpoint::EndpointAddress;
@@ -122,17 +122,17 @@ impl UsbIpCodec {
     const DEVICE_INFO_SIZE: usize = 256 + 32 + (3 * 4) + (3 * 2) + 6;
     const INTERFACE_INFO_SIZE: usize = 4;
     const URB_HEADER_SIZE: usize = 4 * 4;
-    
-    fn decode_urb_header(c: &mut Cursor<BytesMut>) -> io::Result<(u32, u32, EndpointAddress)> {
-        let seqnum = c.get_u32_be();
-        let devid = c.get_u32_be();
 
-        let direction = c.get_u32_be();
+    fn decode_urb_header(c: &mut Cursor<BytesMut>) -> io::Result<(u32, u32, EndpointAddress)> {
+        let seqnum = c.get_u32();
+        let devid = c.get_u32();
+
+        let direction = c.get_u32();
         if !(direction <= 1) {
             return Err(invalid_data());
         }
 
-        let ep = c.get_u32_be();
+        let ep = c.get_u32();
         if !(ep <= 15) {
             return Err(invalid_data());
         }
@@ -153,13 +153,13 @@ impl UsbIpCodec {
         busid[..dev.busid.len()].copy_from_slice(dev.busid.as_bytes());
         buf.extend_from_slice(&busid[..]);
 
-        buf.put_u32_be(dev.busnum);
-        buf.put_u32_be(dev.devnum);
-        buf.put_u32_be(dev.speed);
+        buf.put_u32(dev.busnum);
+        buf.put_u32(dev.devnum);
+        buf.put_u32(dev.speed);
 
-        buf.put_u16_be(dev.id_vendor);
-        buf.put_u16_be(dev.id_product);
-        buf.put_u16_be(dev.bcd_device);
+        buf.put_u16(dev.id_vendor);
+        buf.put_u16(dev.id_product);
+        buf.put_u16(dev.bcd_device);
 
         buf.put_u8(dev.device_class);
         buf.put_u8(dev.device_subclass);
@@ -177,10 +177,10 @@ impl UsbIpCodec {
     }
 
     fn encode_urb_header(seqnum: u32, devnum: u32, ep: EndpointAddress, buf: &mut BytesMut) {
-        buf.put_u32_be(seqnum);
-        buf.put_u32_be(devnum);
-        buf.put_u32_be(if ep.direction() == UsbDirection::Out { 0 } else { 1 });
-        buf.put_u32_be(ep.number() as u32);
+        buf.put_u32(seqnum);
+        buf.put_u32(devnum);
+        buf.put_u32(if ep.direction() == UsbDirection::Out { 0 } else { 1 });
+        buf.put_u32(ep.number() as u32);
     }
 }
 
@@ -197,7 +197,7 @@ impl Decoder for UsbIpCodec {
             return Ok(None);
         }
 
-        let op = c.get_u32_be();
+        let op = c.get_u32();
 
         match op {
             OP_REQ_DEVLIST => {
@@ -205,9 +205,9 @@ impl Decoder for UsbIpCodec {
                     return Ok(None);
                 }
 
-                c.get_u32_be(); // status (unused)
+                c.get_u32(); // status (unused)
 
-                src.split_to(c.position() as usize);
+                src.advance(c.position() as usize);
 
                 return Ok(Some(Request::DevList));
             },
@@ -216,13 +216,13 @@ impl Decoder for UsbIpCodec {
                     return Ok(None);
                 }
 
-                c.get_u32_be(); // status (unused)
+                c.get_u32(); // status (unused)
 
                 let mut busname = [0u8; 32];
                 c.copy_to_slice(&mut busname);
                 let busname = String::from_utf8_lossy(&busname).trim_end_matches('\0').to_string();
 
-                src.split_to(c.position() as usize);
+                src.advance(c.position() as usize);
 
                 return Ok(Some(Request::Import(busname)));
             },
@@ -233,11 +233,11 @@ impl Decoder for UsbIpCodec {
 
                 let (seqnum, devid, ep) = Self::decode_urb_header(&mut c)?;
 
-                let transfer_flags = c.get_u32_be();
-                let transfer_buffer_length = c.get_u32_be();
-                let start_frame = c.get_u32_be();
-                let number_of_packets = c.get_u32_be();
-                let interval = c.get_u32_be();
+                let transfer_flags = c.get_u32();
+                let transfer_buffer_length = c.get_u32();
+                let start_frame = c.get_u32();
+                let number_of_packets = c.get_u32();
+                let interval = c.get_u32();
 
                 let mut setup = [0u8; 8];
                 c.copy_to_slice(&mut setup);
@@ -248,7 +248,7 @@ impl Decoder for UsbIpCodec {
                     None
                 };
 
-                src.split_to(c.position() as usize);
+                src.advance(c.position() as usize);
 
                 let data: Option<Bytes> = if ep.direction() == UsbDirection::Out {
                     if c.remaining() < transfer_buffer_length as usize {
@@ -280,7 +280,7 @@ impl Decoder for UsbIpCodec {
 
                 let (seqnum, devid, ep) = Self::decode_urb_header(&mut c)?;
 
-                let unlink_seqnum = c.get_u32_be();
+                let unlink_seqnum = c.get_u32();
 
                 return Ok(Some(Request::Unlink(UnlinkRequest {
                     seqnum,
@@ -296,11 +296,10 @@ impl Decoder for UsbIpCodec {
     }
 }
 
-impl Encoder for UsbIpCodec {
-    type Item = Response;
+impl Encoder<Response> for UsbIpCodec {
     type Error = io::Error;
 
-    fn encode(&mut self, msg: Self::Item, buf: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, msg: Response, buf: &mut BytesMut) -> Result<(), Self::Error> {
         match msg {
             Response::DevList(devices) => {
                 buf.reserve(
@@ -311,9 +310,9 @@ impl Encoder for UsbIpCodec {
                             + d.interfaces.len() * Self::INTERFACE_INFO_SIZE)
                         .sum::<usize>());
 
-                buf.put_u32_be(OP_REP_DEVLIST); // version, reply code
-                buf.put_u32_be(0); // status (operation cannot fail)
-                buf.put_u32_be(devices.len() as u32);
+                buf.put_u32(OP_REP_DEVLIST); // version, reply code
+                buf.put_u32(0); // status (operation cannot fail)
+                buf.put_u32(devices.len() as u32);
 
                 for dev in devices {
                     Self::encode_device_info(&dev.device, buf);
@@ -329,8 +328,8 @@ impl Encoder for UsbIpCodec {
                     + if res.device.is_some() { Self::DEVICE_INFO_SIZE } else { 0 }
                 );
 
-                buf.put_u32_be(OP_REP_IMPORT); // version, reply code
-                buf.put_u32_be(res.status);
+                buf.put_u32(OP_REP_IMPORT); // version, reply code
+                buf.put_u32(res.status);
 
                 if let Some(dev) = res.device {
                     Self::encode_device_info(&dev, buf);
@@ -341,15 +340,15 @@ impl Encoder for UsbIpCodec {
 
                 buf.reserve(4 + Self::URB_HEADER_SIZE + (5 * 4) + 8 + data_len);
 
-                buf.put_u32_be(OP_RET_SUBMIT);
-                
+                buf.put_u32(OP_RET_SUBMIT);
+
                 Self::encode_urb_header(res.seqnum, res.devid, res.ep, buf);
 
-                buf.put_u32_be(res.status);
-                buf.put_u32_be(data_len as u32); // actual_length
-                buf.put_u32_be(res.actual_start_frame);
-                buf.put_u32_be(res.number_of_packets);
-                buf.put_u32_be(res.error_count);
+                buf.put_u32(res.status);
+                buf.put_u32(data_len as u32); // actual_length
+                buf.put_u32(res.actual_start_frame);
+                buf.put_u32(res.number_of_packets);
+                buf.put_u32(res.error_count);
 
                 buf.put_slice(&res.setup.unwrap_or([0u8; 8]));
 
@@ -359,11 +358,11 @@ impl Encoder for UsbIpCodec {
             },
             Response::Unlink(res) => {
                 buf.reserve(4 + Self::URB_HEADER_SIZE + 4);
-                
-                buf.put_u32_be(OP_RET_UNLINK);
+
+                buf.put_u32(OP_RET_UNLINK);
 
                 Self::encode_urb_header(res.seqnum, res.devid, res.ep, buf);
-                buf.put_u32_be(res.status);
+                buf.put_u32(res.status);
             },
         }
 

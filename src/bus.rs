@@ -1,8 +1,3 @@
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-use bytes::BytesMut;
-use tokio::prelude::*;
-use tokio::sync::mpsc;
 use tokio::sync::watch;
 use usb_device::{
     Result, UsbError, UsbDirection,
@@ -11,34 +6,20 @@ use usb_device::{
     endpoint::{EndpointDescriptor, EndpointAddress},
     bus::PollResult,
 };
+use crate::server::BusChannel;
 use crate::endpoint::{EndpointOut, EndpointIn};
 
 pub const NUM_ENDPOINTS: usize = 16;
 
 pub struct UsbBus {
-    bus_id: String,
-    urb_queue: Arc<Mutex<VecDeque<Urb>>>,
-    completer: mpsc::UnboundedSender<Urb>,
-    complete_receiver: mpsc::UnboundedReceiver<Urb>,
-    //classes: Vec<ClassWrapper>,
-    poll_sender: watch::Sender<()>,
-    poll_receiver: watch::Receiver<()>,
+    channel: BusChannel,
 }
 
 /// Virtual USB peripheral driver
 impl UsbBus {
-    pub(crate) fn new(bus_id: &str) -> UsbAllocator<Self> {
-        let (completer, complete_receiver) = mpsc::unbounded_channel();
-        let (poll_sender, poll_receiver) = watch::channel(());
-
+    pub(crate) fn new(channel: BusChannel) -> UsbAllocator<Self> {
         UsbAllocator::new(UsbBus {
-            bus_id: String::from(bus_id),
-            urb_queue: Arc::new(Mutex::new(VecDeque::new())),
-            complete_receiver,
-            completer,
-            //classes: Vec::new(),
-            poll_sender,
-            poll_receiver,
+            channel,
         })
     }
 
@@ -49,7 +30,7 @@ impl UsbBus {
 
 impl UsbBus {
     pub fn poller(&self) -> watch::Receiver<()> {
-        self.poll_receiver.clone()
+        self.channel.poller()
     }
 }
 
@@ -59,10 +40,7 @@ impl usb_device::bus::UsbBus for UsbBus {
     type EndpointAllocator = EndpointAllocator;
 
     fn create_allocator(&mut self) -> EndpointAllocator {
-        EndpointAllocator::new(BusChannel {
-            urb_queue: Arc::clone(&self.urb_queue),
-            completer: self.completer.clone(),
-        })
+        EndpointAllocator::new(self.channel.clone())
     }
 
     fn enable(&mut self) {
@@ -78,7 +56,13 @@ impl usb_device::bus::UsbBus for UsbBus {
     }
 
     fn poll(&mut self) -> PollResult {
-        PollResult::None
+        // TODO
+        
+        PollResult::Data {
+            ep_out: 0xffff,
+            ep_in_complete: 0xffff,
+            ep_setup: 0x001,
+        }
     }
 
     fn set_stalled(&mut self, ep_addr: EndpointAddress, stalled: bool) {
@@ -172,65 +156,4 @@ impl usb_device::bus::EndpointAllocator<UsbBus> for EndpointAllocator {
 
         Ok(EndpointIn::new(descriptor, self.channel.clone()))
     }
-}
-
-struct BusChannelCore {
-    urb_queue: Arc<Mutex<VecDeque<Urb>>>,
-    completer: mpsc::UnboundedSender<Urb>,
-}
-
-impl BusChannelCore {
-    pub fn enqueue_urb(&self, urb: Urb) {
-        let mut urb_queue = self.urb_queue.lock().unwrap();
-
-        urb_queue.push_back(urb);
-    }
-
-    pub fn channel(&self) -> BusChannel {
-        BusChannel {
-            urb_queue: Arc::clone(&self.urb_queue),
-            completer: self.completer.clone(),
-        }
-    }
-}
-
-pub struct BusChannel {
-    urb_queue: Arc<Mutex<VecDeque<Urb>>>,
-    completer: mpsc::UnboundedSender<Urb>,
-}
-
-impl BusChannel {
-    pub fn clone(&self) -> BusChannel {
-        BusChannel {
-            urb_queue: Arc::clone(&self.urb_queue),
-            completer: self.completer.clone(),
-        }
-    }
-
-    pub fn take_next_urb(&mut self, ep_addr: EndpointAddress) -> Option<Urb> {
-        let mut queue = self.urb_queue.lock().unwrap();
-
-        match queue.iter()
-            .enumerate()
-            .find(|u| u.1.ep == ep_addr)
-        {
-            Some((index, _)) => {
-                queue.remove(index)
-            },
-            None => None,
-        }
-    }
-
-    pub fn complete_urb(&mut self, urb: Urb) {
-        self.completer.send(urb);
-    }
-}
-
-pub struct Urb {
-    pub seqnum: u32,
-    pub devid: u32,
-    pub ep: EndpointAddress,
-    pub len: usize,
-    pub setup: Option<[u8; 8]>,
-    pub data: BytesMut,
 }

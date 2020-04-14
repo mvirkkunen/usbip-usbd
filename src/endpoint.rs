@@ -1,13 +1,13 @@
 use bytes::Bytes;
 use usb_device::{
-    Result, UsbError,
+    Result, UsbError, UsbDirection,
     endpoint::{
         Endpoint as _,
         EndpointAddress,
         EndpointDescriptor
     }
 };
-use crate::bus::{Urb, BusChannel};
+use crate::server::{Urb, BusChannel, ControlState};
 
 fn update_urb<'a>(
     ep_addr: EndpointAddress,
@@ -77,6 +77,35 @@ impl usb_device::endpoint::EndpointOut for EndpointOut {
             None => return Err(UsbError::WouldBlock),
         };
 
+        if let Some(mut control) = urb.control {
+            match control.state {
+                ControlState::Setup => {
+                    // This is the SETUP part of a control transfer, return the SETUP packet
+
+                    match urb.req_ep.direction() { 
+                        UsbDirection::Out => {
+                            // Control OUT - this endpoint will keep the request
+
+                            if control.length > 0 {
+                                // DATA stage - prepare to read data
+                            }
+                        },
+
+                        UsbDirection::In => {
+
+                        },
+                    }
+
+                    buf[..8].copy_from_slice(&control.setup);
+
+                    return Ok(8);
+                },
+                ControlState::DataOut => {
+                    // continue handling below like any URB
+                }
+            }
+        }
+        
         if urb.data.len() <= buf.len() {
             // The remaining data will be returned by this read, so the URB will be completed
 
@@ -92,7 +121,7 @@ impl usb_device::endpoint::EndpointOut for EndpointOut {
             let len = max_packet_size;
             buf.copy_from_slice(urb.data.split_to(len).as_ref());
 
-            return Ok(len);
+            Ok(len);
         }
     }
 }
@@ -142,6 +171,8 @@ impl usb_device::endpoint::EndpointIn for EndpointIn {
         if buf.len() > self.max_packet_size() as usize {
             return Err(UsbError::BufferOverflow);
         }
+
+        println!("writing {:?}", buf);
 
         let max_packet_size = self.max_packet_size() as usize;
 

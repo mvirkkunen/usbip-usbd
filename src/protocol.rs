@@ -5,7 +5,7 @@ use tokio::codec::{Encoder, Decoder};
 use usb_device::UsbDirection;
 use usb_device::endpoint::EndpointAddress;
 
-const VERSION: u32 = 0x01000000;
+const VERSION: u32 = 0x01110000;
 const OP_REQ_DEVLIST: u32 = VERSION | 0x8005;
 const OP_REP_DEVLIST: u32 = VERSION | 0x0005;
 const OP_REQ_IMPORT: u32 = VERSION | 0x8003;
@@ -189,6 +189,8 @@ impl Decoder for UsbIpCodec {
     type Error = io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        println!("decoding {:?}", src);
+
         let mut c = Cursor::new(src.clone());
 
         if c.remaining() < 4 {

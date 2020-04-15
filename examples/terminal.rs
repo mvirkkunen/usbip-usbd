@@ -18,23 +18,24 @@ async fn main() {
 
     println!("USB-IP server is running.");
     println!("Try:");
+    println!("  [modprobe vhci-hcd]");
     println!("  usbip list -r {}", ip);
     println!("  usbip attach -r {} -b 1-1", ip);
 
     Command::new("usbip")
-        .arg("list")
-        .arg("-r")
-        .arg(ip.to_string())
+        .arg("-d")
+        //.arg("list")
+        .arg("attach")
+        .arg("-r").arg(ip.to_string())
+        .arg("-b").arg("1-1")
         .spawn()
         .expect("failed to spawn usbip");
 
     while let Ok(mut client) = listener.accept().await {
-        println!("wow");
-
         tokio::spawn(async move {
             let mut serial = SerialPort::new();
 
-            let (usbcore, mut poller) = client.attach("1-1");
+            let (usbcore, mut _poller) = client.attach("1-1");
 
             let mut usb_dev = UsbDeviceBuilder::new(usbcore, UsbVidPid(0x16c0, 0x27dd))
                 .manufacturer("Fake company")
@@ -49,12 +50,12 @@ async fn main() {
             tokio::spawn(client.run());
 
             loop {
-                delay_for(Duration::from_millis(100)).await;
+                delay_for(Duration::from_millis(10)).await;
 
                 // TODO: figure out when we need to fire this
                 //poller.poll().await;
 
-                println!("pollo");
+                //println!("pollo");
 
                 if usb_dev.poll(&mut serial).is_err() {
                     continue;

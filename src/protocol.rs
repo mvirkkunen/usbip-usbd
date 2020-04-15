@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::io::{self, Cursor};
+use std::sync::Arc;
 use bytes::*;
 use tokio_util::codec::{Encoder, Decoder};
 
@@ -25,7 +27,7 @@ pub enum Request {
 
 #[derive(Debug)]
 pub enum Response {
-    DevList(Vec<DeviceInterfaceInfo>),
+    DevList(Vec<Arc<DeviceInterfaceInfo>>),
     Import(ImportResponse),
     Submit(SubmitResponse),
     Unlink(UnlinkResponse),
@@ -33,7 +35,7 @@ pub enum Response {
 
 #[derive(Debug)]
 pub struct DeviceInterfaceInfo {
-    pub device: DeviceInfo,
+    pub device: Arc<DeviceInfo>,
     pub interfaces: Vec<InterfaceInfo>,
 }
 
@@ -65,7 +67,7 @@ pub struct InterfaceInfo {
 #[derive(Debug)]
 pub struct ImportResponse {
     pub status: u32,
-    pub device: Option<DeviceInfo>,
+    pub device: Option<Arc<DeviceInfo>>,
 }
 
 #[derive(Debug)]
@@ -110,18 +112,27 @@ pub struct UnlinkResponse {
     pub devid: u32,
     pub ep: EndpointAddress,
     pub status: u32,
+    pub unlink_seqnum: u32,
 }
 
 fn invalid_data() -> io::Error {
     io::Error::from(io::ErrorKind::InvalidData)
 }
 
-pub struct UsbIpCodec;
+pub struct UsbIpCodec {
+    length_cache: HashMap<u32, usize>,
+}
 
 impl UsbIpCodec {
     const DEVICE_INFO_SIZE: usize = 256 + 32 + (3 * 4) + (3 * 2) + 6;
     const INTERFACE_INFO_SIZE: usize = 4;
     const URB_HEADER_SIZE: usize = 4 * 4;
+
+    pub fn new() -> Self {
+        UsbIpCodec {
+            length_cache: HashMap::new(),
+        }
+    }
 
     fn decode_urb_header(c: &mut Cursor<BytesMut>) -> io::Result<(u32, u32, EndpointAddress)> {
         let seqnum = c.get_u32();
@@ -189,17 +200,17 @@ impl Decoder for UsbIpCodec {
     type Error = io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        println!("decoding {:?}", src);
-
         let mut c = Cursor::new(src.clone());
 
         if c.remaining() < 4 {
             return Ok(None);
         }
 
+        println!("decoding {:02x?}", &src[..]);
+
         let op = c.get_u32();
 
-        match op {
+        let item = match op {
             OP_REQ_DEVLIST => {
                 if c.remaining() < 4 {
                     return Ok(None);
@@ -209,10 +220,10 @@ impl Decoder for UsbIpCodec {
 
                 src.advance(c.position() as usize);
 
-                return Ok(Some(Request::DevList));
+                Request::DevList
             },
             OP_REQ_IMPORT => {
-                if c.remaining() < 4 + 43 {
+                if c.remaining() < 4 + 32 {
                     return Ok(None);
                 }
 
@@ -224,7 +235,7 @@ impl Decoder for UsbIpCodec {
 
                 src.advance(c.position() as usize);
 
-                return Ok(Some(Request::Import(busname)));
+                Request::Import(busname)
             },
             OP_CMD_SUBMIT => {
                 if c.remaining() < Self::URB_HEADER_SIZE + (5 * 4) + 8 {
@@ -232,6 +243,8 @@ impl Decoder for UsbIpCodec {
                 }
 
                 let (seqnum, devid, ep) = Self::decode_urb_header(&mut c)?;
+
+                let waste_start = c.remaining();
 
                 let transfer_flags = c.get_u32();
                 let transfer_buffer_length = c.get_u32();
@@ -260,7 +273,9 @@ impl Decoder for UsbIpCodec {
                     None
                 };
 
-                return Ok(Some(Request::Submit(SubmitRequest {
+                self.length_cache.insert(seqnum, waste_start - c.remaining() as usize);
+
+                Request::Submit(SubmitRequest {
                     seqnum,
                     devid,
                     ep,
@@ -271,7 +286,7 @@ impl Decoder for UsbIpCodec {
                     interval,
                     setup,
                     data,
-                })));
+                })
             },
             OP_CMD_UNLINK => {
                 if c.remaining() < Self::URB_HEADER_SIZE + 8 {
@@ -282,17 +297,40 @@ impl Decoder for UsbIpCodec {
 
                 let unlink_seqnum = c.get_u32();
 
-                return Ok(Some(Request::Unlink(UnlinkRequest {
+                match self.length_cache.get(&unlink_seqnum) {
+                    Some(len) => {
+                        let len = *len - 4;
+
+                        println!("waste len: {}", len);
+
+                        if c.remaining() < len {
+                            return Ok(None);
+                        }
+
+                        c.advance(len);
+                    },
+                    None => {
+                        panic!("Received unlink for unknown seqnum: {}", seqnum);
+                    }
+                }
+
+                src.advance(c.position() as usize);
+
+                Request::Unlink(UnlinkRequest {
                     seqnum,
                     devid,
                     ep,
                     unlink_seqnum,
-                })));
+                })
             },
             _ => {
-                Err(invalid_data())
+                return Err(invalid_data());
             }
-        }
+        };
+
+        println!("Recv: {:?}", &item);
+
+        return Ok(Some(item));
     }
 }
 
@@ -300,6 +338,8 @@ impl Encoder<Response> for UsbIpCodec {
     type Error = io::Error;
 
     fn encode(&mut self, msg: Response, buf: &mut BytesMut) -> Result<(), Self::Error> {
+        println!("Send: {:?}", &msg);
+
         match msg {
             Response::DevList(devices) => {
                 buf.reserve(
@@ -317,7 +357,7 @@ impl Encoder<Response> for UsbIpCodec {
                 for dev in devices {
                     Self::encode_device_info(&dev.device, buf);
 
-                    for iface in dev.interfaces {
+                    for iface in &dev.interfaces {
                         Self::encode_interface_info(&iface, buf)
                     }
                 }
@@ -355,6 +395,8 @@ impl Encoder<Response> for UsbIpCodec {
                 if let Some(data) = res.data {
                     buf.put_slice(&data);
                 }
+
+                self.length_cache.remove(&res.seqnum);
             },
             Response::Unlink(res) => {
                 buf.reserve(4 + Self::URB_HEADER_SIZE + 4);
@@ -363,6 +405,17 @@ impl Encoder<Response> for UsbIpCodec {
 
                 Self::encode_urb_header(res.seqnum, res.devid, res.ep, buf);
                 buf.put_u32(res.status);
+
+                match self.length_cache.remove(&res.unlink_seqnum) {
+                    Some(len) => {
+                        for _ in 0..len {
+                            buf.put_u8(0);
+                        }
+                    },
+                    None => {
+                        panic!("Received unlink for unknown seqnum: {}", res.seqnum);
+                    }
+                }
             },
         }
 

@@ -53,6 +53,7 @@ impl usbcore::UsbEndpoint for EndpointOut {
     }
 
     fn set_stalled(&mut self, is_stalled: bool) -> Result<()> {
+        //println!("{:?} set_stalled({})", self.address, is_stalled);
         self.stalled = is_stalled;
 
         Ok(())
@@ -65,8 +66,6 @@ impl usbcore::UsbEndpoint for EndpointOut {
 
 impl usbcore::UsbEndpointOut for EndpointOut {
     fn read_packet(&mut self, buf: &mut [u8]) -> Result<(usize, OutPacketType)> {
-        println!("read {:?}", self.address);
-
         if buf.len() < self.max_packet_size {
             return Err(UsbError::BufferOverflow);
         }
@@ -74,32 +73,21 @@ impl usbcore::UsbEndpointOut for EndpointOut {
         let urb = update_urb(self.address, &mut self.urb, &mut self.channel)
             .ok_or(UsbError::WouldBlock)?;
 
+        println!("read {:?}", self.address);
+
         if let Some(ref mut control) = urb.control {
             match control.state {
                 ControlState::Setup => {
                     // Return SETUP data
 
-                    let req = &control.request;
-
-                    buf[..8].copy_from_slice(&[
-                        // bmRequestType
-                        (req.direction as u8) | ((req.request_type as u8) << 5) | (req.recipient as u8),
-                        // bRequest
-                        req.request,
-                        // wValue
-                        req.value as u8, (req.value >> 8) as u8,
-                        // wIndex
-                        req.index as u8, (req.index >> 8) as u8,
-                        // wLength
-                        req.length as u8, (req.length >> 8) as u8,
-                    ]);
+                    buf[..8].copy_from_slice(&control.setup);
 
                     if urb.len > 0 {
                         // There is a data stage
 
                         control.state = ControlState::Data;
 
-                        if req.direction == UsbDirection::In {
+                        if urb.req_ep.direction() == UsbDirection::In {
                             // Data is in the other direction - pass to other endpoint
 
                             self.channel.complete_urb(self.urb.take().unwrap());
@@ -111,6 +99,8 @@ impl usbcore::UsbEndpointOut for EndpointOut {
 
                         self.channel.complete_urb(self.urb.take().unwrap());
                     }
+
+                    println!("return SETUP");
 
                     return Ok((8, OutPacketType::Setup));
                 },
@@ -203,6 +193,7 @@ impl usbcore::UsbEndpoint for EndpointIn {
     }
 
     fn set_stalled(&mut self, is_stalled: bool) -> Result<()> {
+        //println!("{:?} set_stalled({})", self.address, is_stalled);
         self.stalled = is_stalled;
 
         Ok(())
@@ -219,7 +210,7 @@ impl usbcore::UsbEndpointIn for EndpointIn {
             return Err(UsbError::BufferOverflow);
         }
 
-        println!("writing {:?}", buf);
+        println!("writing {:?} {}", buf, self.max_packet_size);
 
         let urb = update_urb(self.address, &mut self.urb, &mut self.channel)
             .ok_or(UsbError::WouldBlock)?;

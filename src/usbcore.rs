@@ -1,4 +1,3 @@
-use tokio::sync::watch;
 use usb_device::{
     Result, UsbError, UsbDirection,
     //class::UsbClass,

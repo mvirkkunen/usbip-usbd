@@ -66,8 +66,8 @@ async fn main() {
                 loop {
                     match serial.read(&mut buf[..]) {
                         Ok(count) => {
-                            stdout.write_all(&buf[..count]).await
-                                .expect("failed to write to stdout");
+                            stdout.write_all(&buf[..count]).await.expect("failed to write to stdout");
+                            stdout.flush().await.expect("failed to flush stdout");
                         },
                         Err(UsbError::WouldBlock) => break,
                         Err(err) => {

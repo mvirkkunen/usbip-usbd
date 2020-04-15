@@ -73,7 +73,7 @@ impl usbcore::UsbEndpointOut for EndpointOut {
         let urb = update_urb(self.address, &mut self.urb, &mut self.channel)
             .ok_or(UsbError::WouldBlock)?;
 
-        println!("read {:?}", self.address);
+        //println!("read {:?}", self.address);
 
         if let Some(ref mut control) = urb.control {
             match control.state {
@@ -100,8 +100,6 @@ impl usbcore::UsbEndpointOut for EndpointOut {
                         self.channel.complete_urb(self.urb.take().unwrap());
                     }
 
-                    println!("return SETUP");
-
                     return Ok((8, OutPacketType::Setup));
                 },
 
@@ -121,13 +119,15 @@ impl usbcore::UsbEndpointOut for EndpointOut {
             }
         }
 
+        //println!("data: {:?}", urb.data);
+
         if urb.data.len() <= self.max_packet_size {
             // The remaining data will be returned by this read, so the URB will be completed
 
             // TODO: Do we need to simulate ZLP
 
             let len = urb.data.len();
-            buf[..len].copy_from_slice(&urb.data);
+            buf[..len].copy_from_slice(urb.data.split_to(len).as_ref());
 
             if let Some(ref mut control) = urb.control {
                 match control.state {
@@ -210,7 +210,7 @@ impl usbcore::UsbEndpointIn for EndpointIn {
             return Err(UsbError::BufferOverflow);
         }
 
-        println!("writing {:?} {}", buf, self.max_packet_size);
+        //println!("writing {:?} {}", buf, self.max_packet_size);
 
         let urb = update_urb(self.address, &mut self.urb, &mut self.channel)
             .ok_or(UsbError::WouldBlock)?;

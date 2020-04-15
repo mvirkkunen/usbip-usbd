@@ -113,7 +113,7 @@ impl Client {
                             number_of_packets: 0,
                             error_count: 0,
                             setup: None,
-                            data: Some(urb.data.into()),
+                            data: urb.data,
                         })).await.expect("send failed");
             }
         });
@@ -181,7 +181,7 @@ impl Client {
                             req_ep: req.ep,
                             control,
                             len: req.transfer_buffer_length as usize,
-                            data: BytesMut::new(),
+                            data: req.data,
                             internal: false,
                         });
                     } else {
@@ -197,7 +197,7 @@ impl Client {
                                     number_of_packets: 0,
                                     error_count: 0,
                                     setup: None,
-                                    data: None,
+                                    data: BytesMut::new(),
                                 })).await.expect("send failed");
                     }
                 },
@@ -271,7 +271,7 @@ impl ClientCore {
     }
 
     pub fn submit_urb(&mut self, urb: Urb) {
-        println!("submit: {:?}", &urb);
+        //println!("submit: {:?}", &urb);
 
         // Control transfers must always first be directed to the control OUT endpoint for SETUP
         /*if urb.is_control {
@@ -523,7 +523,7 @@ impl CoreChannel {
                         UsbDirection::In => UsbDirection::Out,
                     };
 
-                    println!("passing to {:?}", status_dir);
+                    //println!("passing to {:?}", status_dir);
 
                     urb.ep = EndpointAddress::from_parts(urb.ep.number(), status_dir);
 

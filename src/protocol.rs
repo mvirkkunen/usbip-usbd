@@ -114,6 +114,14 @@ pub struct UnlinkResponse {
     pub unlink_seqnum: u32,
 }
 
+#[repr(u32)]
+pub enum ResponseStatus {
+    Ok = 0,
+    EndpointStalled = 32, // EPIPE
+    Unlinked = 104, // ECONNRESET
+    ShortTransfer = 121, // EREMOTEIO
+}
+
 fn invalid_data() -> io::Error {
     io::Error::from(io::ErrorKind::InvalidData)
 }
